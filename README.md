@@ -1,72 +1,81 @@
-# 🚁 Sim2SIMA: Autonomous Drone Tactical Simulation (DPO & RLHF)
+# Sim2SIMA
 
-Sim2SIMA is an advanced simulation framework for training and evaluating autonomous drone tactics using **LLM-based decision making**. It features a **Dual-Brain Architecture** (SFT + DPO) and supports **Human-in-the-Loop (RLHF)** via a manual control interface.
+A drone tactics simulator that uses LLMs for decision-making. It has a DPO
+and RLHF pipeline bolted on, so preference data collected from manual human
+overrides can be used to incrementally tune the SFT model.
 
-## 🌟 Key Features
+## Why this exists
 
-### 🧠 Dual-Brain Architecture
-- **Reflex Core (`sima_sft.py`)**: Powered by **Gemma 4B SFT**, handling split-second tactical maneuvers (Orbit, Chase, Retreat) via strict JSON output.
-- **Reasoning Core (`sima_model.py`)**: Powered by **Gemma 12B (Ollama)**, providing natural language situational awareness and tactical briefings.
+I first tried using a single Gemma 12B for everything — situational awareness
+and immediate action selection. Inference was too slow for a real-time loop,
+so I split the model in two:
 
-### 🎯 Direct Preference Optimization (DPO) Pipeline
-- **Auto Data Collection**: Automatically logs drone decisions (Prompt + Chosen/Rejected Action) into `dpo_preference_data_v2.jsonl`.
-- **Real-time Scorecard**: Visualizes candidate actions and tactical reasoning (e.g., "Distance > 2km → Chase Preferred") in the Web UI.
-- **Offline Training**: `train_dpo.py` fine-tunes the SFT model using the collected preference data.
+- A small SFT model (Gemma 4B) emits actions as JSON
+- A larger model (Gemma 12B via Ollama) handles natural-language situational
+  briefings in the background
 
-### 🎮 Human-in-the-Loop (RLHF)
-- **Manual Control Center**: Direct override buttons (`CHASE`, `RETREAT`, `INTERCEPT`, `PATROL`) in the UI.
-- **Implicit Feedback**: When a human overrides the AI, the system pauses DPO generation, allowing for cleaner ground-truth data collection (future feature).
+It's not as fancy as "Dual-Brain Architecture" makes it sound, but it works.
 
-## 📂 File Structure
+## DPO data collection
 
-- `sima_app.py`: Main Flask application (Simulation Server, Web UI, Map).
-- `dpo_core.py`: DPO logic, State Builder, Candidate Generation, and Scoring/Judging.
-- `sima_sft.py`: Loads the SFT (Fine-tuned) model and generates actions.
-- `sima_model.py`: Connects to Ollama for natural language interaction.
-- `train_dpo.py`: Script to train the DPO adapter using `trl`.
-- `geo_db.py`: Terrain and geospatial analysis utilities.
+In auto mode, every decision logs the candidate actions (Orbit, Chase, Retreat,
+etc.), the chosen one, and the rejected ones into
+`dpo_preference_data_v2.jsonl`. How chosen/rejected gets decided is hardcoded
+as heuristics in `dpo_core.py` — e.g. "distance > 2km → prefer Chase". This
+part is still rule-based and has obvious limits.
 
-## 🚀 Getting Started
+Manual overrides should give cleaner ground truth, so when a human takes
+control, automatic DPO generation pauses. The pipeline that turns those
+override logs into training data isn't wired up yet though.
 
-### Prerequisites
+## Manual control (for RLHF)
+
+The web UI has `CHASE`, `RETREAT`, `INTERCEPT`, `PATROL` buttons that override
+the AI's decision. This becomes implicit feedback for the model.
+
+## File layout
+
+- `sima_app.py` — Flask server, simulation loop, map UI
+- `dpo_core.py` — state builder, candidate generation, scoring
+- `sima_sft.py` — loads the SFT adapter and runs action inference
+- `sima_model.py` — calls the 12B model via Ollama
+- `train_dpo.py` — uses `trl` to train a DPO adapter from the collected jsonl
+- `geo_db.py` — terrain / geospatial utilities
+
+## Running it
+
+Requirements:
+
 - Python 3.10+
-- PyTorch (CUDA supported)
-- [Ollama](https://ollama.com/) (for Gemma 12B)
-- Hugging Face Token (for Gemma access)
+- PyTorch (CUDA recommended; SFT inference on CPU is painful)
+- Ollama (to host the 12B model)
+- A Hugging Face token (for Gemma access)
 
-### Installation
+Setup:git clone https://github.com/charing999/sim2sima.git
+cd sim2sima
+pip install torch transformers peft trl flask folium requests
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/charing999/sim2sima.git
-   cd sim2sima
-   ```
+The SFT adapter should be at `DPO_drone/gemma3-drone-web-sft`. Pull the
+reasoning model with `ollama pull gemma3:12b`.
 
-2. **Install Dependencies**
-   ```bash
-   pip install torch transformers peft trl flask folium requests
-   ```
+Run the server:python sima_app.py
 
-3. **Setup Models**
-   - Ensure the SFT adapter is located at `DPO_drone/gemma3-drone-web-sft`.
-   - Pull the reasoning model: `ollama pull gemma3:12b`.
+Open `http://localhost:5000`. Leave it in AUTO mode to let the AI drive and
+collect data, or use the manual buttons to intervene.
 
-### ✨ Usage
+Once you've collected enough samples, train a new adapter:python train_dpo.py
 
-1. **Run the Simulation Server**
-   ```bash
-   python sima_app.py
-   ```
-   - Open `http://localhost:5000` in your browser.
-   - Use the **Manual Control Buttons** to test specific tactics.
-   - Switch "DPO Mode Toggle" to **AUTO** to let the AI drive and collect data.
+The DPO-tuned adapter gets saved to `gemma3-drone-dpo`.
 
-2. **Train DPO Model**
-   Once you have collected enough data in `dpo_preference_data_v2.jsonl`:
-   ```bash
-   python train_dpo.py
-   ```
-   This will save a new DPO-tuned adapter in `gemma3-drone-dpo`.
+## Known limitations
 
-## 🛡️ License
-Private / Research Use Only.
+- The chosen/rejected judgment is rule-based, so any bias in the rules
+  propagates into the DPO model.
+- Manual-override logs aren't yet converted into DPO training samples
+  automatically.
+- The simulation environment is simple. The gap to a real drone control
+  stack is large.
+
+## License
+
+Research / personal use only. Contact me for commercial use.
