@@ -1,8 +1,8 @@
-﻿# sima_app.py - 寃쎈웾??踰꾩쟾
+# sima_app.py - 경량화 버전
 """
-SIMA ?쒕줎 ?꾩닠 ?쒕??덉씠???쒖뒪??(Slim Version)
-- geo_db.py: 吏??遺꾩꽍 (rasterio)
-- sima_model.py: 濡쒖뺄 LLM (Ollama)
+SIMA 드론 전술 시뮬레이션 시스템 (Slim Version)
+- geo_db.py: 지형 분석 (rasterio)
+- sima_model.py: 로컬 LLM (Ollama)
 """
 
 import json
@@ -20,18 +20,18 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 from folium import CustomIcon, Element
 from PIL import Image, ImageDraw
 
-from geo_db import get_terrain_analysis, init_analyzer  # 吏??遺꾩꽍 (Hybrid)
-from sima_model import sima_chat, sima_chat_json  # 濡쒖뺄 LLM
-from sima_sft import init_sft_model # 紐⑤뜽 濡쒕뜑
+from geo_db import get_terrain_analysis, init_analyzer  # 지형 분석 (Hybrid)
+from sima_model import sima_chat, sima_chat_json  # 로컬 LLM
+from sima_sft import init_sft_model # 모델 로더
 from dpo_core import build_dpo_state, generate_candidates, judge_candidates, save_preference_log  # DPO Core (KR reasons + UI meta)
 
-# Flask 濡쒓렇 ?듭젣
+# Flask 로그 억제
 log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
 
 
 # ============================================================
-# ?곹깭(怨듭쑀 硫붾え由?
+# 상태(공유 메모리)
 # ============================================================
 SYSTEM_STATE_LOCK = threading.Lock()
 SYSTEM_STATE: Dict[str, Any] = {
@@ -67,29 +67,29 @@ DRONE_COMMAND_QUEUE: "queue.Queue[str]" = queue.Queue()
 
 
 # ============================================================
-# 紐⑤뱶蹂??대룞 留?
+# 모드별 이동 맵
 # ============================================================
 ACTION_MAP = {
     "CHASE":   {"N": ["UP"], "S": ["DOWN"], "E": ["RIGHT"], "W": ["LEFT"],
                 "NE": ["UP", "RIGHT"], "NW": ["UP", "LEFT"], "SE": ["DOWN", "RIGHT"], "SW": ["DOWN", "LEFT"]},
     "RETREAT": {"N": ["DOWN"], "S": ["UP"], "E": ["LEFT"], "W": ["RIGHT"],
                 "NE": ["DOWN", "LEFT"], "NW": ["DOWN", "RIGHT"], "SE": ["UP", "LEFT"], "SW": ["UP", "RIGHT"]},
-    "ORBIT":   {},  # ORBIT 紐⑤뱶??JS ?먯쑉 鍮꾪뻾 (?쒕쾭 紐낅졊 ?놁쓬)
+    "ORBIT":   {},  # ORBIT 모드는 JS 자율 비행 (서버 명령 없음)
 }
 
 
 # ============================================================
-# ?좊떅 ?뺣낫
+# 유닛 정보
 # ============================================================
 UNITS = {
-    "TANK": "T-80湲??꾩감",
-    "TANK2": "T-72湲??꾩감",
-    "DRONE": "?뺤같???쒕줎",
+    "TANK": "T-80급 전차",
+    "TANK2": "T-72급 전차",
+    "DRONE": "정찰용 드론",
 }
 
 
 # ============================================================
-# Flask ??
+# Flask 앱
 # ============================================================
 app = Flask(__name__)
 
@@ -100,7 +100,7 @@ def ensure_dirs():
 
 
 def ensure_assets():
-    """?쒕줎/?깊겕 ?꾩씠肄??앹꽦"""
+    """드론/탱크 아이콘 생성"""
     drone_path = os.path.join("static", "drone.png")
     tank_path = os.path.join("static", "tank.png")
 
@@ -126,14 +126,14 @@ def ensure_assets():
 
 
 # ============================================================
-# SHORT Fast-path (LLM ?고쉶)
+# SHORT Fast-path (LLM 우회)
 # ============================================================
 def is_distance_command(msg: str) -> bool:
     m = (msg or "").lower()
-    complex_kw = ["媛??, "?됯퇏", "?대뵒", "異붿쿇", "nearest", "average"]
+    complex_kw = ["가장", "평균", "어디", "추천", "nearest", "average"]
     if any(k in m for k in complex_kw):
         return False
-    keys = ["嫄곕━", "distance", "?깊겕", "t-80", "t-72", "bearing", "諛⑹쐞", "?곹깭"]
+    keys = ["거리", "distance", "탱크", "t-80", "t-72", "bearing", "방위", "상태"]
     return any(k in m for k in keys)
 
 
@@ -146,42 +146,42 @@ def build_sensor_reply() -> str:
         ts = float(SYSTEM_STATE.get("LAST_TELEMETRY_TS", 0.0))
 
     age = time.time() - ts if ts > 0 else 999.0
-    ## kr : ?쒕줎??紐⑺몴 諛섍꼍 踰쀬뼱?ъ쓣 ?? ?쇰쭏??媛뺥븯寃??ㅼ떆 ?먮옒 沅ㅻ룄濡?蹂듦??쒗궗吏 寃곗젙?섎뒗 媛?
-    status_kr = {"DETECTED": "?먯???, "SEARCHING": "?먯깋以?, "INIT": "珥덇린??}.get(status, status)
-    bearing_kr = {"N": "遺?, "S": "??, "E": "??, "W": "??, "NE": "遺곷룞", "NW": "遺곸꽌", "SE": "?⑤룞", "SW": "?⑥꽌"}.get(bearing, bearing)
+    ## kr : 드론이 목표 반경 벗어났을 때, 얼마나 강하게 다시 원래 궤도로 복귀시킬지 결정하는 값
+    status_kr = {"DETECTED": "탐지됨", "SEARCHING": "탐색중", "INIT": "초기화"}.get(status, status)
+    bearing_kr = {"N": "북", "S": "남", "E": "동", "W": "서", "NE": "북동", "NW": "북서", "SE": "남동", "SW": "남서"}.get(bearing, bearing)
 
-    parts = [f"?쇱꽌 媛깆떊: {age:.1f}珥???]
-    if status: parts.append(f"?곹깭: {status_kr}")
+    parts = [f"센서 갱신: {age:.1f}초 전"]
+    if status: parts.append(f"상태: {status_kr}")
     if dist1 is not None: parts.append(f"T-80: {dist1:.1f}m")
     if dist2 is not None: parts.append(f"T-72: {dist2:.1f}m")
-    if bearing: parts.append(f"諛⑹쐞: {bearing_kr}")
+    if bearing: parts.append(f"방위: {bearing_kr}")
 
-    return " / ".join(parts) if len(parts) > 1 else "?붾젅硫뷀듃由??湲?以?.."
+    return " / ".join(parts) if len(parts) > 1 else "텔레메트리 대기 중..."
 
 
 # ============================================================
-# ?몄궗/?〓떞 泥섎━ (LLM ?고쉶)
+# 인사/잡담 처리 (LLM 우회)
 # ============================================================
 def handle_greeting(msg: str) -> Optional[str]:
-    """?몄궗/?〓떞 媛먯? ??媛꾨떒 ?묐떟 諛섑솚, ?꾨땲硫?None"""
+    """인사/잡담 감지 시 간단 응답 반환, 아니면 None"""
     m = (msg or "").strip().lower()
     
-    # ?몄궗 ?⑦꽩
-    greetings = ["?덈뀞", "?섏씠", "?щ줈", "hello", "hi", "hey", "諛섍???, "諛섍컩", "?덈뀞?섏꽭??]
+    # 인사 패턴
+    greetings = ["안녕", "하이", "헬로", "hello", "hi", "hey", "반가워", "반갑", "안녕하세요"]
     if any(g in m for g in greetings) and len(m) < 20:
-        return "?덈뀞?섏꽭?? SIMA ?꾩닠 吏???쒖뒪?쒖엯?덈떎. 吏??遺꾩꽍?대굹 ?곹솴 蹂닿퀬媛 ?꾩슂?섏떆硫?留먯???二쇱꽭??"
+        return "안녕하세요! SIMA 전술 지원 시스템입니다. 지형 분석이나 상황 보고가 필요하시면 말씀해 주세요."
     
-    # 媛먯궗 ?⑦꽩
-    thanks = ["怨좊쭏??, "媛먯궗", "?≫걧", "thanks", "thank you", "?긱뀉"]
+    # 감사 패턴
+    thanks = ["고마워", "감사", "땡큐", "thanks", "thank you", "ㄱㅅ"]
     if any(t in m for t in thanks) and len(m) < 20:
-        return "泥쒕쭔?먯슂! 異붽? 吏?먯씠 ?꾩슂?섏떆硫??몄젣??留먯???二쇱꽭??"
+        return "천만에요! 추가 지원이 필요하시면 언제든 말씀해 주세요."
     
     return None
 # ============================================================
-# LLM 釉뚮━??(JSON ?뺣떟吏 湲곕컲)
+# LLM 브리핑 (JSON 정답지 기반)
 # ============================================================
 def format_briefing_llm(user_msg: str) -> str:
-    """吏???뺣떟吏 + ?쇱꽌 ?뺣낫 ??LLM 釉뚮━??""
+    """지형 정답지 + 센서 정보 → LLM 브리핑"""
     import json
     from datetime import datetime
 
@@ -192,20 +192,20 @@ def format_briefing_llm(user_msg: str) -> str:
         dist2 = SYSTEM_STATE.get("LAST_DIST2")
         bearing = SYSTEM_STATE.get("LAST_BEARING")
 
-    # 吏??遺꾩꽍
+    # 지형 분석
     try:
         terrain_context = get_terrain_analysis(lat, lng, radius_m=500)
     except Exception as e:
         terrain_context = {"error": str(e)}
 
-    # ?쇱꽌 ?뺣낫 異붽?
+    # 센서 정보 추가
     terrain_context["sensor"] = {
         "tank1_dist_m": dist1,
         "tank2_dist_m": dist2,
         "bearing": bearing
     }
 
-    # ?뺣떟吏 JSON ?뚯씪 ???
+    # 정답지 JSON 파일 저장
     os.makedirs("logs", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join("logs", f"terrain_{timestamp}.json")
@@ -213,10 +213,10 @@ def format_briefing_llm(user_msg: str) -> str:
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(terrain_context, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.error(f"?뺣떟吏 ????ㅽ뙣: {e}")
+        logging.error(f"정답지 저장 실패: {e}")
 
     system_instruction = (
-        "臾댁“嫄??쒓뎅?대줈 ?듬? ?? "
+        "무조건 한국어로 답변 해. "
         "Role: You are a Tactical Terrain Analyst AI. "
         "You must answer the user's request based ONLY on the provided 'Reference Context' (JSON).\n"
         "Do not hallucinate or fetch external information.\n\n"
@@ -258,8 +258,8 @@ def toggle_dpo_mode():
         new = "MANUAL" if cur == "AUTO" else "AUTO"
         SYSTEM_STATE["DPO_MODE"] = new
 
-        # 蹂댄넻 MANUAL?대㈃ ?щ엺 媛쒖엯(override) 耳쒓퀬,
-        # AUTO硫?override ?꾨뒗 ?앹쑝濡??곌껐?⑸땲??
+        # 보통 MANUAL이면 사람 개입(override) 켜고,
+        # AUTO면 override 끄는 식으로 연결합니다.
         SYSTEM_STATE["HUMAN_OVERRIDE"] = (new == "MANUAL")
 
         return jsonify({
@@ -272,7 +272,7 @@ def toggle_dpo_mode():
 
 @app.route("/dpo_last")
 def dpo_last():
-    """UI?? 理쒓렐 ?꾨낫 ?먯닔?쒕? 諛섑솚"""
+    """UI용: 최근 후보 점수표를 반환"""
     with SYSTEM_STATE_LOCK:
         return jsonify({
             "ok": True,
@@ -292,23 +292,23 @@ def dpo_last():
 
 @app.route("/dpo_select", methods=["POST"])
 def dpo_select():
-    """MANUAL 紐⑤뱶?먯꽌 ?ъ슜?먭? ?꾨낫瑜??좏깮??preference log濡????+ ?됰룞 諛섏쁺"""
+    """MANUAL 모드에서 사용자가 후보를 선택해 preference log로 저장 + 행동 반영"""
     try:
         payload = request.get_json(force=True, silent=True) or {}
         cid = int(payload.get("candidate_id"))
     except Exception:
-        return jsonify({"ok": False, "error": "candidate_id媛 ?щ컮瑜댁? ?딆뒿?덈떎."})
+        return jsonify({"ok": False, "error": "candidate_id가 올바르지 않습니다."})
 
     with SYSTEM_STATE_LOCK:
         if SYSTEM_STATE.get("DPO_MODE") != "MANUAL" or not SYSTEM_STATE.get("HUMAN_OVERRIDE"):
-            return jsonify({"ok": False, "error": "MANUAL 紐⑤뱶?먯꽌留??좏깮?????덉뒿?덈떎. (DPO 紐⑤뱶 ?좉? ?꾩슂)"})
+            return jsonify({"ok": False, "error": "MANUAL 모드에서만 선택할 수 있습니다. (DPO 모드 토글 필요)"})
 
         full = SYSTEM_STATE.get("DPO_LAST_FULL") or []
         state = SYSTEM_STATE.get("DPO_LAST_STATE")
         prompt = SYSTEM_STATE.get("DPO_LAST_PROMPT")
 
     if not full or not state:
-        return jsonify({"ok": False, "error": "?좏깮???꾨낫 ?곗씠?곌? ?놁뒿?덈떎. (?깊겕媛 2km ?대궡濡??ㅼ뼱????앹꽦??"})
+        return jsonify({"ok": False, "error": "선택할 후보 데이터가 없습니다. (탱크가 2km 이내로 들어와야 생성됨)"})
 
     chosen = None
     for c in full:
@@ -316,21 +316,21 @@ def dpo_select():
             chosen = c
             break
     if chosen is None:
-        return jsonify({"ok": False, "error": f"candidate_id={cid} ?꾨낫瑜?李얠쓣 ???놁뒿?덈떎."})
+        return jsonify({"ok": False, "error": f"candidate_id={cid} 후보를 찾을 수 없습니다."})
 
-    # rejected: ?섎㉧吏 以?理쒖? ?먯닔 (?놁쑝硫????遺덇?)
+    # rejected: 나머지 중 최저 점수 (없으면 저장 불가)
     others = [c for c in full if int(c.get("candidate_id", -1)) != cid]
     if not others:
-        return jsonify({"ok": False, "error": "?꾨낫媛 1媛쒕퓧?대씪 preference pair瑜?留뚮뱾 ???놁뒿?덈떎."})
+        return jsonify({"ok": False, "error": "후보가 1개뿐이라 preference pair를 만들 수 없습니다."})
     rejected = sorted(others, key=lambda x: float(x.get("score", -1e9)))[0]
 
-    # preference log entry 援ъ꽦
+    # preference log entry 구성
     try:
         import json as _json
         chosen_json = _json.dumps(chosen.get("normalized", {}), ensure_ascii=False)
         rejected_json = _json.dumps(rejected.get("normalized", {}), ensure_ascii=False)
 
-        # UI-friendly scored table (?대? judge?먯꽌 怨꾩궛??
+        # UI-friendly scored table (이미 judge에서 계산됨)
         candidates_scored = []
         for c in full:
             candidates_scored.append({
@@ -364,9 +364,9 @@ def dpo_select():
         }
         save_preference_log(log_entry)
     except Exception as e:
-        return jsonify({"ok": False, "error": f"濡쒓렇 ????ㅽ뙣: {e}"})
+        return jsonify({"ok": False, "error": f"로그 저장 실패: {e}"})
 
-    # ?됰룞 諛섏쁺 (湲곗〈 留ㅽ븨 濡쒖쭅怨??숈씪)
+    # 행동 반영 (기존 매핑 로직과 동일)
     action = str(chosen.get("action", "ORBIT")).upper().strip()
     params = chosen.get("params", {}) if isinstance(chosen.get("params", {}), dict) else {}
 
@@ -392,15 +392,15 @@ def dpo_select():
 
 @app.route("/manual_command", methods=["POST"])
 def manual_command():
-    """UI 踰꾪듉??吏곸젒 ?쒖뼱 紐낅졊"""
+    """UI 버튼용 직접 제어 명령"""
     try:
         payload = request.get_json(force=True, silent=True) or {}
         action = str(payload.get("action", "")).upper()
     except Exception:
         return jsonify({"ok": False, "error": "Invalid payload"})
 
-    # ACTION_MAP???뺤쓽??紐⑤뱶?몄? ?뺤씤
-    # INTERCEPT/PATROL? ?몄쓽???덉슜?섎릺 ?ㅼ젣 援щ룞 紐⑤뱶(CHASE/ORBIT)濡?留ㅽ븨
+    # ACTION_MAP에 정의된 모드인지 확인
+    # INTERCEPT/PATROL은 편의상 허용하되 실제 구동 모드(CHASE/ORBIT)로 매핑
     valid_actions = ["CHASE", "RETREAT", "ORBIT", "HOLD", "PATROL", "INTERCEPT"]
     if action not in valid_actions:
         return jsonify({"ok": False, "error": f"Unknown action: {action}"})
@@ -409,12 +409,12 @@ def manual_command():
     if action == "INTERCEPT":
         mode = "CHASE"
     elif action == "PATROL":
-        mode = "ORBIT"  # 湲곕낯 ?뺤같? ?좏쉶
+        mode = "ORBIT"  # 기본 정찰은 선회
 
     with SYSTEM_STATE_LOCK:
         SYSTEM_STATE["HUMAN_OVERRIDE"] = True
         SYSTEM_STATE["CURRENT_MODE"] = mode
-        # DPO 濡쒓퉭???붾? ?곹깭 ?낅뜲?댄듃 (?좏깮 ?ы빆)
+        # DPO 로깅용 더미 상태 업데이트 (선택 사항)
         SYSTEM_STATE["DPO_LAST_ACTION"] = action
         SYSTEM_STATE["DPO_LAST_PARAMS"] = {"source": "manual_button"}
 
@@ -494,25 +494,25 @@ def telemetry():
 def chat():
     user_msg = request.form.get("message", "") or ""
 
-    # 1. ?몄궗/?〓떞 (LLM ?고쉶)
+    # 1. 인사/잡담 (LLM 우회)
     greeting_reply = handle_greeting(user_msg)
     if greeting_reply:
         return jsonify({"response": greeting_reply})
 
-    # 2. ?쇱꽌 蹂닿퀬 (LLM ?고쉶)
-    if is_distance_command(user_msg.lower()) or any(k in user_msg.lower() for k in ["?곹솴", "蹂닿퀬"]):
+    # 2. 센서 보고 (LLM 우회)
+    if is_distance_command(user_msg.lower()) or any(k in user_msg.lower() for k in ["상황", "보고"]):
         return jsonify({"response": build_sensor_reply()})
 
-    # 3. LLM 釉뚮━??
+    # 3. LLM 브리핑
     try:
         response = format_briefing_llm(user_msg)
         return jsonify({"response": response[:3000]})
     except Exception as e:
-        return jsonify({"response": f"?ㅻ쪟: {e}"})
+        return jsonify({"response": f"오류: {e}"})
 
 
 # ============================================================
-# 吏???앹꽦
+# 지도 생성
 # ============================================================
 def generate_index_html():
     html_content = """<!DOCTYPE html>
@@ -586,8 +586,8 @@ input { flex:1; padding:12px; background:#0d1117; color:white; border:1px solid 
       <span class="badge" id="b-dpo"><span class="dot"></span><span id="sys-dpo">DPO: -</span></span>
     </div>
     <div style="display:flex; gap:8px; align-items:center;">
-      <button class="ghost small" onclick="toggleDPO()">DPO 紐⑤뱶 ?좉?</button>
-      <button class="secondary small" onclick="quick('?곹솴 蹂닿퀬??)">?곹솴 蹂닿퀬</button>
+      <button class="ghost small" onclick="toggleDPO()">DPO 모드 토글</button>
+      <button class="secondary small" onclick="quick('상황 보고해')">상황 보고</button>
     </div>
   </div>
 
@@ -595,23 +595,23 @@ input { flex:1; padding:12px; background:#0d1117; color:white; border:1px solid 
     <div id="dpo-panel">
       <div id="dpo-head">
         <div>
-          <div id="dpo-title">?꾨낫 ?먯닔??/div>
-          <div id="dpo-sub">理쒓렐 DPO ?ㅽ뀦???꾨낫蹂??먯닔 諛??댁쑀瑜??쒖떆?⑸땲??</div>
+          <div id="dpo-title">후보 점수표</div>
+          <div id="dpo-sub">최근 DPO 스텝의 후보별 점수 및 이유를 표시합니다.</div>
         </div>
-        <button class="secondary small" onclick="refreshDPO(true)">?덈줈怨좎묠</button>
+        <button class="secondary small" onclick="refreshDPO(true)">새로고침</button>
       </div>
       <div id="dpo-cards">
-        <div class="card"><div style="color:var(--muted); font-size:12px;">?꾩쭅 ?꾨낫 ?먯닔 ?곗씠?곌? ?놁뒿?덈떎. (?깊겕媛 2km ?대궡濡??ㅼ뼱?ㅻ㈃ ?앹꽦??</div></div>
+        <div class="card"><div style="color:var(--muted); font-size:12px;">아직 후보 점수 데이터가 없습니다. (탱크가 2km 이내로 들어오면 생성됨)</div></div>
       </div>
     </div>
 
     <div id="chat-container">
-      <div class="msg ai">SIMA ?쒖뒪???⑤씪??/div>
+      <div class="msg ai">SIMA 시스템 온라인</div>
     </div>
 
     <div id="input-area">
-      <input type="text" id="txt" placeholder="紐낅졊 ?낅젰..."/>
-      <button onclick="send()">?꾩넚</button>
+      <input type="text" id="txt" placeholder="명령 입력..."/>
+      <button onclick="send()">전송</button>
     </div>
   </div>
 </div>
@@ -678,7 +678,7 @@ async function selectCandidate(cid){
   if(data && data.ok){
     refreshDPO(true);
   }else{
-    alert(data && data.error ? data.error : '?좏깮 ?ㅽ뙣');
+    alert(data && data.error ? data.error : '선택 실패');
   }
 }
 
@@ -691,7 +691,7 @@ function renderCards(payload){
   if(!cands.length){
     const empty = document.createElement('div');
     empty.className = 'card';
-    empty.innerHTML = `<div style="color:var(--muted); font-size:12px;">?꾩쭅 ?꾨낫 ?먯닔 ?곗씠?곌? ?놁뒿?덈떎.</div>`;
+    empty.innerHTML = `<div style="color:var(--muted); font-size:12px;">아직 후보 점수 데이터가 없습니다.</div>`;
     cardsEl.appendChild(empty);
     return;
   }
@@ -732,15 +732,15 @@ function renderCards(payload){
       const lis = reasons.map(x=>`<li>${escapeHtml(String(x))}</li>`).join('');
       reasonsHtml = `<ul class="reasons">${lis}</ul>`;
     }else{
-      reasonsHtml = `<div style="margin-top:8px; color:var(--muted); font-size:12px;">?댁쑀 ?놁쓬</div>`;
+      reasonsHtml = `<div style="margin-top:8px; color:var(--muted); font-size:12px;">이유 없음</div>`;
     }
 
     let actionsHtml = '';
-    // MANUAL + override???뚮쭔 ?좏깮 踰꾪듉??蹂댁뿬以?
+    // MANUAL + override일 때만 선택 버튼을 보여줌
     if(dpoMode === 'MANUAL' && override){
       actionsHtml = `
         <div class="card-actions">
-          <button class="ghost small" onclick="selectCandidate(${c.candidate_id})">???꾨낫 ?좏깮</button>
+          <button class="ghost small" onclick="selectCandidate(${c.candidate_id})">이 후보 선택</button>
         </div>
       `;
     }
@@ -784,7 +784,7 @@ setInterval(()=>{ refreshDPO(false); }, 800);
 
 def generate_simulation_map():
     ensure_dirs()
-    # ?덉뼇/?몃뜒??吏??(DSK_2026 ?섏뒪??踰붿쐞)
+    # 안양/인덕원 지역 (DSK_2026 래스터 범위)
     start_lat, start_lng = 37.40, 126.97
     end_lat, end_lng = 37.43, 127.00
     center_lat = (start_lat + end_lat) / 2
@@ -803,7 +803,7 @@ def generate_simulation_map():
     """
     m.get_root().html.add_child(Element(hud_html))
 
-    # 留덉빱
+    # 마커
     drone_icon_path = os.path.join("static", "drone.png")
     tank_icon_path = os.path.join("static", "tank.png")
     drone_icon = CustomIcon(drone_icon_path, icon_size=(48, 48), icon_anchor=(24, 24)) if os.path.exists(drone_icon_path) else None
@@ -831,30 +831,30 @@ def generate_simulation_map():
     }}
     window.droneTarget=null;window.droneSpeed=0.00003;window.autoTrack=true;
 
-    // Orbit(?먰삎 ?좏쉶) ?뚮씪誘명꽣
+    // Orbit(원형 선회) 파라미터
     window.orbit = {{
       enabled: true,
-      radius_m: 500,   // 紐⑺몴臾쇨낵 ?좎???諛섍꼍(?? 300~800m)
-      vt_mps: 25,      // ?묒꽑 ?띾룄 (m/s) ?? 10~25
-      clockwise: true, // ?쒓퀎 諛⑺뼢
-      max_mps: 30,      // ?띾룄 ?곹븳(?덉젙??
-      // ?ы솕 蹂듭썝 ?뚮씪誘명꽣
-      k: 20,        // 諛⑹궗 蹂듭썝 理쒕? 媛뺣룄 ?ㅼ??????m/s湲?
-      korbit: 6.0,  // ?ы솕 誘쇨컧???댁닔濡?鍮⑤━ ?ы솕)
+      radius_m: 500,   // 목표물과 유지할 반경(예: 300~800m)
+      vt_mps: 25,      // 접선 속도 (m/s) 예: 10~25
+      clockwise: true, // 시계 방향
+      max_mps: 30,      // 속도 상한(안정화)
+      // 포화 복원 파라미터
+      k: 20,        // 방사 복원 최대 강도 스케일(대략 m/s급)
+      korbit: 6.0,  // 포화 민감도(클수록 빨리 포화)
     }};
 
-    // ?꾧꼍??-> 濡쒖뺄 誘명꽣 蹂??洹쇱궗, ?묒? 援ъ뿭?먯꽌 異⑸텇)
+    // 위경도 -> 로컬 미터 변환(근사, 작은 구역에서 충분)
     function metersPerDegLat() {{ return 111320.0; }}
     function metersPerDegLng(lat) {{ return 111320.0 * Math.cos(lat * Math.PI / 180); }}
 
-    // (lat,lng) 李⑥씠瑜?meters (x=?? y=遺?濡?
+    // (lat,lng) 차이를 meters (x=동, y=북)로
     function dLatLngToMeters(dLat, dLng, refLat) {{
       const mx = dLng * metersPerDegLng(refLat);
       const my = dLat * metersPerDegLat();
       return {{ x: mx, y: my }};
     }}
 
-    // meters (x,y)瑜?(dLat,dLng)濡?
+    // meters (x,y)를 (dLat,dLng)로
     function metersToDLatLng(x, y, refLat) {{
       const dLat = y / metersPerDegLat();
       const dLng = x / metersPerDegLng(refLat);
@@ -901,33 +901,33 @@ def generate_simulation_map():
                 const tPos2 = window.tank2Obj.getLatLng();
                 const dist1 = dPos.distanceTo(tPos1);
                 const dist2 = dPos.distanceTo(tPos2);
-                // 嫄곕━ 怨꾩궛
+                // 거리 계산
                 const tPos = (dist1 <= dist2) ? tPos1 : tPos2;
 
-                const dLat = dPos.lat - tPos.lat; // ?꾨룄 李⑥씠
-                const dLng = dPos.lng - tPos.lng; // 寃쎈룄 李⑥씠
-                const v = dLatLngToMeters(dLat, dLng, tPos.lat); // ?꾨룄, 寃쎈룄 李⑥씠瑜??ㅼ젣 誘명꽣濡?蹂??
-                const r = Math.max(Math.hypot(v.x, v.y), 1e-3); // 以묒떖源뚯????꾩옱 吏곸꽑嫄곕━ r
+                const dLat = dPos.lat - tPos.lat; // 위도 차이
+                const dLng = dPos.lng - tPos.lng; // 경도 차이
+                const v = dLatLngToMeters(dLat, dLng, tPos.lat); // 위도, 경도 차이를 실제 미터로 변환
+                const r = Math.max(Math.hypot(v.x, v.y), 1e-3); // 중심까지의 현재 직선거리 r
 
-                const er = r - window.orbit.radius_m; // ?꾩옱 嫄곕━ - 紐⑺몴 500m 李⑥씠, ?묒닔硫??밴꺼???섍퀬 ?뚯닔硫?諛?대궡????
-                const cw = window.orbit.clockwise ? 1 : -1; // ?쒓퀎諛⑺뼢?대㈃ 1, 諛섏떆怨꾨갑?μ씠硫?-1
+                const er = r - window.orbit.radius_m; // 현재 거리 - 목표 500m 차이, 양수면 당겨야 하고 음수면 밀어내야 함.
+                const cw = window.orbit.clockwise ? 1 : -1; // 시계방향이면 1, 반시계방향이면 -1
                 
-                // 諛⑺뼢 踰≫꽣瑜?怨꾩궛?섎뒗 ?섏떇
-                const urx = v.x / r, ury = v.y / r;  // 諛⑹궗 踰≫꽣
-                const utx = cw * ury, uty = cw * -urx; // ?묒꽑 踰≫꽣
+                // 방향 벡터를 계산하는 수식
+                const urx = v.x / r, ury = v.y / r;  // 방사 벡터
+                const utx = cw * ury, uty = cw * -urx; // 접선 벡터
                 
-                // 理쒖쥌 ?띾룄 怨꾩궛
-                // 諛⑹궗 諛⑺뼢 蹂듭썝 ?띾룄 ?깅텇 (?ы솕??
+                // 최종 속도 계산
+                // 방사 방향 복원 속도 성분 (포화형)
                 const vr = -window.orbit.k * Math.atan(window.orbit.korbit * (er / window.orbit.radius_m));
 
-                // 理쒖쥌 ?띾룄 = 諛⑹궗 蹂듭썝 + ?묒꽑 ?좏쉶
+                // 최종 속도 = 방사 복원 + 접선 선회
                 let vx = vr * urx + window.orbit.vt_mps * utx;
                 let vy = vr * ury + window.orbit.vt_mps * uty;
 
 
-                const sp = Math.hypot(vx, vy); // ?꾩옱 ?띾룄 ?ш린
-                const vmax = window.orbit.max_mps; // 理쒕? ?띾룄
-                if (sp > vmax) {{ vx *= (vmax / sp); vy *= (vmax / sp); }} // 理쒕? ?띾룄瑜??좎??섍린 ?꾪빐 ?뺢퇋?? 鍮꾩쑉??以꾩뿬 理쒕? ?띾룄??留욎땄.
+                const sp = Math.hypot(vx, vy); // 현재 속도 크기
+                const vmax = window.orbit.max_mps; // 최대 속도
+                if (sp > vmax) {{ vx *= (vmax / sp); vy *= (vmax / sp); }} // 최대 속도를 유지하기 위해 정규화, 비율을 줄여 최대 속도에 맞춤.
 
                 const dx = vx * dt;
                 const dy = vy * dt;
@@ -1003,12 +1003,12 @@ def generate_simulation_map():
     m.save("templates/sim_map.html")
 
 # ============================================================
-# Spinal Logic (利됯컖 ?묐떟 ?먯쑉 紐⑤뱶 + SFT 異붾줎)
+# Spinal Logic (즉각 응답 자율 모드 + SFT 추론)
 # ============================================================
 def spinal_logic_loop():
-    print("??Spinal Cord Active")
+    print("⚡ Spinal Cord Active")
     last_inference_time = 0
-    inference_interval = 2.0  # 2珥덈쭏??異붾줎 (GPU 遺??議곗젅)
+    inference_interval = 2.0  # 2초마다 추론 (GPU 부하 조절)
 
     while True:
         with SYSTEM_STATE_LOCK:
@@ -1024,7 +1024,7 @@ def spinal_logic_loop():
             time.sleep(0.1)
             continue
 
-        # DPO Pipeline: State -> Candidates -> Judge (AUTO???ㅽ뻾/濡쒓렇 ??? MANUAL? ?먯닔?쒕쭔 媛깆떊)
+        # DPO Pipeline: State -> Candidates -> Judge (AUTO는 실행/로그 저장, MANUAL은 점수표만 갱신)
         if perm and dist is not None:
             now = time.time()
             if now - last_inference_time > inference_interval:
@@ -1041,7 +1041,7 @@ def spinal_logic_loop():
                     # L5: Judge (score + reasons)
                     chosen, rejected, log_entry = judge_candidates(candidates, state)
 
-                    # --- UI/debug state update (MANUAL/AUTO 怨듯넻) ---
+                    # --- UI/debug state update (MANUAL/AUTO 공통) ---
                     with SYSTEM_STATE_LOCK:
                         SYSTEM_STATE["DPO_LAST_TS"] = now
                         SYSTEM_STATE["DPO_LAST_DIST_M"] = float(dist) if dist is not None else None
@@ -1050,13 +1050,13 @@ def spinal_logic_loop():
                         SYSTEM_STATE["DPO_LAST_STATE"] = state
                         SYSTEM_STATE["DPO_LAST_PROMPT"] = (log_entry or {}).get("prompt")
 
-                        # AUTO????利됱떆 best ?꾨낫瑜?selected濡??쒖떆
+                        # AUTO일 땐 즉시 best 후보를 selected로 표시
                         if not override:
                             SYSTEM_STATE["DPO_LAST_CHOSEN_ID"] = chosen.get("candidate_id")
                             SYSTEM_STATE["DPO_LAST_CHOSEN_ACTION"] = chosen.get("action")
                             SYSTEM_STATE["DPO_LAST_CHOSEN_SCORE"] = chosen.get("score")
 
-                    # --- AUTO: preference log ???+ ?됰룞 諛섏쁺 ---
+                    # --- AUTO: preference log 저장 + 행동 반영 ---
                     if not override and log_entry:
                         save_preference_log(log_entry)
                         print(f"[Spinal] Judge Selected: {chosen['action']} (Score: {chosen['score']}) vs Rejected: {rejected['action']}")
@@ -1083,7 +1083,7 @@ def spinal_logic_loop():
                                 SYSTEM_STATE["CURRENT_MODE"] = mode
 
                 last_inference_time = now
-        # ?대룞 紐낅졊 ?앹꽦 (湲곗〈 濡쒖쭅 ?좎?)
+        # 이동 명령 생성 (기존 로직 유지)
         if mode in ("CHASE", "RETREAT") and bearing:
             keys = ACTION_MAP.get(mode, {}).get(bearing, [])
             for k in keys:
@@ -1102,8 +1102,8 @@ def run_flask():
 def main():
     ensure_dirs()
     ensure_assets()
-    init_analyzer()  # 吏??遺꾩꽍湲?珥덇린??(?섏뒪??罹먯떛)
-    init_sft_model() # SFT 紐⑤뜽 濡쒕뱶 (Gemma 3 4B)
+    init_analyzer()  # 지형 분석기 초기화 (래스터 캐싱)
+    init_sft_model() # SFT 모델 로드 (Gemma 3 4B)
     generate_index_html()
     generate_simulation_map()
 
@@ -1117,22 +1117,22 @@ def main():
     print("Starting Terminal Chat... (Type 'exit' to quit)")
     try:
         while True:
-            # ?곕????낅젰 ?湲?
-            user_input = input("\n[USER] 吏덈Ц: ")
+            # 터미널 입력 대기
+            user_input = input("\n[USER] 질문: ")
             
-            if user_input.lower() in ["exit", "quit", "醫낅즺"]:
+            if user_input.lower() in ["exit", "quit", "종료"]:
                 print("Exit.")
                 break
             
             if not user_input.strip():
                 continue
                 
-            print("...", end="", flush=True)  # 濡쒕뵫 以?
+            print("...", end="", flush=True)  # 로딩 중
             
-            # ?ш린??format_briefing_llm ?몄텧 (吏???쇱꽌 遺꾩꽍 + RAG)
+            # 여기서 format_briefing_llm 호출 (지형/센서 분석 + RAG)
             try:
                 response = format_briefing_llm(user_input)
-                print(f"\r[SIMA] ?듬?: {response}\n")
+                print(f"\r[SIMA] 답변: {response}\n")
             except Exception as e:
                 print(f"\r[Error] {e}\n")
                 

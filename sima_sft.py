@@ -1,4 +1,4 @@
-﻿import os
+import os
 import torch
 import json
 import random
@@ -180,4 +180,3 @@ def predict_action(drone_lat=37.4, drone_lng=126.9, dist_to_target=1500):
     except Exception as e:
         print(f"[SFT] Inference Error: {e}")
         return "ORBIT" # Safe fallback
-
