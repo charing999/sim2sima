@@ -4,13 +4,6 @@ A drone tactics simulator that uses LLMs for decision-making. It has a DPO
 and RLHF pipeline bolted on, so preference data collected from manual human
 overrides can be used to incrementally tune the SFT model.
 
-The decision-making logic from this simulator was integrated into a
-ROS-based drone system and deployed at **Drone Show Korea 2026** (DSK 2026).
-My role was the AI side — building the tactical decision loop, DPO pipeline,
-and terrain-aware state representation. A separate ROS engineer handled the
-hardware integration and flight stack. I handed off the model and inference
-code; they wired it into the actual drone.
-
 ## Deployment context
 
 The tactical decision code here ended up in a ROS-based drone for
