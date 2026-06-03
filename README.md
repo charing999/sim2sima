@@ -11,6 +11,13 @@ and terrain-aware state representation. A separate ROS engineer handled the
 hardware integration and flight stack. I handed off the model and inference
 code; they wired it into the actual drone.
 
+## Deployment context
+
+The tactical decision code here ended up in a ROS-based drone for
+Drone Show Korea 2026. I handled the AI side — decision loop, DPO pipeline,
+and terrain analysis. A separate engineer did the ROS integration and flight
+stack. I handed off a Python package; they wired it in.
+
 ## Why this exists
 
 I first tried using a single Gemma 12B for everything — situational awareness
@@ -39,6 +46,19 @@ override logs into training data isn't wired up yet though.
 
 The web UI has `CHASE`, `RETREAT`, `INTERCEPT`, `PATROL` buttons that override
 the AI's decision. This becomes implicit feedback for the model.
+
+## Terrain data (DSK_2026)
+
+`geo_db.py` reads raster files covering the DSK 2026 venue near Anyang /
+Indeokwon. Four layers: DEM, slope, aspect, and LULC (Ministry of Environment
+land classification). Files aren't in the repo. Point to yours:
+
+    DEM_PATH=/path/to/base_dem_3857.tif
+    SLOPE_PATH=/path/to/base_slope_3857.tif
+    ASPECT_PATH=/path/to/base_aspect_3857.tif
+    LULC_PATH=/path/to/base_l3_code_3857.tif
+
+If they're missing, the terrain module skips gracefully and the rest still runs.
 
 ## File layout
 
