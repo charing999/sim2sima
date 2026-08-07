@@ -23,7 +23,13 @@ from PIL import Image, ImageDraw
 from geo_db import get_terrain_analysis, init_analyzer  # 지형 분석 (Hybrid)
 from sima_model import sima_chat, sima_chat_json  # 로컬 LLM
 from sima_sft import init_sft_model # 모델 로더
-from dpo_core import build_dpo_state, generate_candidates, judge_candidates, save_preference_log  # DPO Core (KR reasons + UI meta)
+from dpo_core import (  # DPO Core (KR reasons + UI meta)
+    SAFE_FALLBACK_ACTION,
+    build_dpo_state,
+    generate_candidates,
+    judge_candidates,
+    save_preference_log,
+)
 
 # Flask 로그 억제
 log = logging.getLogger("werkzeug")
@@ -38,6 +44,9 @@ SYSTEM_STATE: Dict[str, Any] = {
     "ENGAGEMENT_PERMISSION": False,
     "HUMAN_OVERRIDE": False,
     "CURRENT_MODE": "PATROL",
+    # 사람이 누른 HOLD가 아니라, 판단 실패로 떨어진 HOLD인지 구분한다.
+    # True면 HOLD 상태에서도 추론 루프를 계속 돌려 복구를 시도한다.
+    "SAFE_HOLD": False,
     "DPO_MODE": "AUTO",
     "IS_CHATTING": False,
     "LAST_LAT": 37.40,
@@ -367,8 +376,26 @@ def dpo_select():
         return jsonify({"ok": False, "error": f"로그 저장 실패: {e}"})
 
     # 행동 반영 (기존 매핑 로직과 동일)
-    action = str(chosen.get("action", "ORBIT")).upper().strip()
+    action = str(chosen.get("action") or SAFE_FALLBACK_ACTION).upper().strip()
     params = chosen.get("params", {}) if isinstance(chosen.get("params", {}), dict) else {}
+
+    # 파싱/스키마 검증에 실패한 후보는 절대 기동으로 반영하지 않는다.
+    if not bool(chosen.get("parse_ok", False)):
+        with SYSTEM_STATE_LOCK:
+            SYSTEM_STATE["DPO_LAST_CHOSEN_ID"] = cid
+            SYSTEM_STATE["DPO_LAST_CHOSEN_ACTION"] = action
+            SYSTEM_STATE["DPO_LAST_CHOSEN_SCORE"] = chosen.get("score")
+            SYSTEM_STATE["DPO_LAST_ACTION"] = SAFE_FALLBACK_ACTION
+            SYSTEM_STATE["DPO_LAST_PARAMS"] = {}
+            SYSTEM_STATE["CURRENT_MODE"] = SAFE_FALLBACK_ACTION
+            SYSTEM_STATE["SAFE_HOLD"] = True
+        return jsonify({
+            "ok": True,
+            "applied_mode": SAFE_FALLBACK_ACTION,
+            "chosen_action": action,
+            "candidate_id": cid,
+            "note": "파싱 실패 후보라 기동에 반영하지 않고 HOLD로 유지합니다.",
+        })
 
     # Map higher-level actions to executable mode in the current web-only controller
     if action == "INTERCEPT":
@@ -386,6 +413,7 @@ def dpo_select():
         SYSTEM_STATE["DPO_LAST_ACTION"] = action
         SYSTEM_STATE["DPO_LAST_PARAMS"] = params
         SYSTEM_STATE["CURRENT_MODE"] = mode
+        SYSTEM_STATE["SAFE_HOLD"] = False
 
     return jsonify({"ok": True, "applied_mode": mode, "chosen_action": action, "candidate_id": cid})
 
@@ -414,6 +442,8 @@ def manual_command():
     with SYSTEM_STATE_LOCK:
         SYSTEM_STATE["HUMAN_OVERRIDE"] = True
         SYSTEM_STATE["CURRENT_MODE"] = mode
+        # 사람이 직접 건 모드이므로 자동 복구 대상이 아니다.
+        SYSTEM_STATE["SAFE_HOLD"] = False
         # DPO 로깅용 더미 상태 업데이트 (선택 사항)
         SYSTEM_STATE["DPO_LAST_ACTION"] = action
         SYSTEM_STATE["DPO_LAST_PARAMS"] = {"source": "manual_button"}
@@ -756,6 +786,8 @@ async function refreshStatus(){
   document.getElementById('sys-pos').innerText = "POS: " + d.lat.toFixed(4) + "," + d.lng.toFixed(4);
   setBadge(document.getElementById('b-mode'), d.mode === 'HOLD' ? 'warn' : 'good');
   setBadge(document.getElementById('b-pos'), 'good');
+  // HOLD면 자율 선회(ORBIT 벡터필드)도 멈춰야 실제로 정지 상태가 된다.
+  if(window.orbit){ window.orbit.enabled = (d.mode !== 'HOLD'); }
 }
 
 async function refreshDPO(force){
@@ -1015,12 +1047,15 @@ def spinal_logic_loop():
             perm = SYSTEM_STATE["ENGAGEMENT_PERMISSION"]
             override = SYSTEM_STATE["HUMAN_OVERRIDE"]
             mode = SYSTEM_STATE["CURRENT_MODE"]
+            safe_hold = SYSTEM_STATE.get("SAFE_HOLD", False)
             dist = SYSTEM_STATE.get("LAST_DIST")
             bearing = SYSTEM_STATE.get("LAST_BEARING")
             lat = SYSTEM_STATE.get("LAST_LAT", 37.40)
             lng = SYSTEM_STATE.get("LAST_LNG", 126.97)
 
-        if mode == "HOLD":
+        # 사람이 건 HOLD는 파이프라인까지 정지시킨다.
+        # 판단 실패로 걸린 HOLD(SAFE_HOLD)는 추론을 계속 돌려야 다음 사이클에 복구된다.
+        if mode == "HOLD" and not safe_hold:
             time.sleep(0.1)
             continue
 
@@ -1057,11 +1092,32 @@ def spinal_logic_loop():
                             SYSTEM_STATE["DPO_LAST_CHOSEN_SCORE"] = chosen.get("score")
 
                     # --- AUTO: preference log 저장 + 행동 반영 ---
-                    if not override and log_entry:
-                        save_preference_log(log_entry)
-                        print(f"[Spinal] Judge Selected: {chosen['action']} (Score: {chosen['score']}) vs Rejected: {rejected['action']}")
+                    # log_entry가 없어도(= 쌍을 만들 수 없는 사이클) 행동 판정은 반드시 지나가야 한다.
+                    # 여기서 빠져나가면 이해하지 못한 사이클에 직전 mode가 그대로 유지된다.
+                    if not override:
+                        if log_entry:
+                            save_preference_log(log_entry)
+                            print(f"[Spinal] Judge Selected: {chosen['action']} (Score: {chosen['score']}) vs Rejected: {rejected['action']}")
 
-                        if chosen.get("action") in ["ORBIT", "CHASE", "RETREAT", "PATROL", "INTERCEPT"]:
+                        executable = (
+                            bool(chosen.get("parse_ok", False))
+                            and chosen.get("action") in ["ORBIT", "CHASE", "RETREAT", "PATROL", "INTERCEPT"]
+                        )
+
+                        if not executable:
+                            # 후보를 하나도 이해하지 못한 상태. 기동 지시 대신 정지한다.
+                            print(
+                                f"[Spinal] Unusable candidate (parse_ok={chosen.get('parse_ok')}, "
+                                f"action={chosen.get('action')}) -> {SAFE_FALLBACK_ACTION}"
+                            )
+                            with SYSTEM_STATE_LOCK:
+                                SYSTEM_STATE["DPO_LAST_ACTION"] = SAFE_FALLBACK_ACTION
+                                SYSTEM_STATE["DPO_LAST_PARAMS"] = {}
+                                SYSTEM_STATE["CURRENT_MODE"] = SAFE_FALLBACK_ACTION
+                                SYSTEM_STATE["SAFE_HOLD"] = True
+                            mode = SAFE_FALLBACK_ACTION
+
+                        if executable:
                             action = chosen.get("action")
                             params = chosen.get("params", {}) if isinstance(chosen.get("params", {}), dict) else {}
 
@@ -1081,6 +1137,7 @@ def spinal_logic_loop():
 
                             with SYSTEM_STATE_LOCK:
                                 SYSTEM_STATE["CURRENT_MODE"] = mode
+                                SYSTEM_STATE["SAFE_HOLD"] = False
 
                 last_inference_time = now
         # 이동 명령 생성 (기존 로직 유지)

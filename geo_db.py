@@ -183,7 +183,7 @@ class TerrainAnalyzer:
         for ds in self._datasets.values():
             try:
                 ds.close()
-            except:
+            except Exception:
                 pass
 
     def __enter__(self):
@@ -261,7 +261,7 @@ class TerrainAnalyzer:
                 "bearing_deg_from_center": bearing_deg,
                 "bearing_cardinal_from_center": bearing_cardinal
             }
-        except:
+        except Exception:
             return None
 
     def analyze(self, lat: float, lon: float, radius_m: float = 500.0, topk_lulc: int = 3) -> Dict[str, Any]:
@@ -365,7 +365,7 @@ class TerrainAnalyzer:
                                 "lat": round(clat, 6),
                                 "lon": round(clon, 6)
                             }
-                    except:
+                    except Exception:
                         pass
                 
                 result["lulc"]["distribution"] = [
@@ -436,7 +436,7 @@ def get_elevation(lat: float, lon: float) -> Optional[float]:
                 return None
             return float(val)
         return None
-    except:
+    except Exception:
         return None
 
 

@@ -1,7 +1,5 @@
 import json
-import random
 import time
-import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, List, Optional, Union
@@ -14,6 +12,10 @@ import sima_sft
 # ============================================================
 
 DRONE_ID_DEFAULT = "drone_1"
+
+# 파싱/스키마 실패 시 떨어질 안전 기본값.
+# ORBIT은 선회 = 능동 기동이라 "모델 출력을 이해하지 못한 상태"의 기본값으로는 부적절하다.
+SAFE_FALLBACK_ACTION = "HOLD"
 
 # ----- Action schema & ranges -----
 ACTION_SPECS: Dict[str, Dict[str, Any]] = {
@@ -192,15 +194,15 @@ def parse_action_and_params(raw_text: str, drone_id: str = DRONE_ID_DEFAULT) -> 
     if coerced is None:
         return {
             "parse_ok": False,
-            "action": "ORBIT",
+            "action": SAFE_FALLBACK_ACTION,
             "params": {},
-            "normalized": {drone_id: {"action": "ORBIT", "params": {}}},
+            "normalized": {drone_id: {"action": SAFE_FALLBACK_ACTION, "params": {}}},
             "error": err or info.get("reason", "unknown"),
             "warnings": ["extract_failed"],
         }
 
     d_info = coerced.get(drone_id) or list(coerced.values())[0]
-    action = str(d_info.get("action", "ORBIT")).upper().strip()
+    action = str(d_info.get("action") or SAFE_FALLBACK_ACTION).upper().strip()
     params = d_info.get("params", {})
 
     if action not in ACTION_SPECS:
@@ -288,8 +290,9 @@ def generate_candidates(state: Dict[str, Any], n: int = 3) -> List[Dict[str, Any
                 "candidate_id": 0,
                 "raw_text": "",
                 "parse_ok": False,
-                "action": "ORBIT",
+                "action": SAFE_FALLBACK_ACTION,
                 "params": {},
+                "normalized": {state.get("drone_id", DRONE_ID_DEFAULT): {"action": SAFE_FALLBACK_ACTION, "params": {}}},
                 "warnings": ["error"],
                 "ui_summary": "Error",
             }
@@ -334,7 +337,7 @@ def judge_candidates(
 
     scored: List[Dict[str, Any]] = []
     for c in candidates:
-        action = c.get("action", "ORBIT")
+        action = c.get("action", SAFE_FALLBACK_ACTION)
         parse_ok = bool(c.get("parse_ok", False))
 
         score = 0.0
@@ -362,6 +365,11 @@ def judge_candidates(
     rejected = scored[-1]
 
     if float(chosen.get("score", 0.0)) <= float(rejected.get("score", 0.0)):
+        return chosen, rejected, None
+
+    # 1등마저 파싱에 실패했다면 후보 전체가 쓰레기다.
+    # 이 쌍을 학습 데이터로 남기면 "덜 나쁜 쓰레기"를 선호하도록 배운다.
+    if not bool(chosen.get("parse_ok", False)):
         return chosen, rejected, None
 
     prompt = None
