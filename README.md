@@ -1,101 +1,192 @@
 # Sim2SIMA
 
-A drone tactics simulator that uses LLMs for decision-making. It has a DPO
-and RLHF pipeline bolted on, so preference data collected from manual human
-overrides can be used to incrementally tune the SFT model.
+LLM으로 드론의 전술 행동을 결정하고, 그 결정을 사람이 고쳐준 기록으로 다시 모델을 학습시키는 시뮬레이터입니다.
+여기 있는 의사결정 코드는 Drone Show Korea 2026 출품 기체의 ROS 스택에 실제로 들어갔습니다.
+저는 AI 쪽 — 결정 루프, DPO 파이프라인, 지형 분석 — 을 맡았고, ROS 연동과 비행 제어는 다른 엔지니어가 맡았습니다.
 
-## Deployment context
+---
 
-The tactical decision code here ended up in a ROS-based drone for
-Drone Show Korea 2026. I handled the AI side — decision loop, DPO pipeline,
-and terrain analysis. A separate engineer did the ROS integration and flight
-stack. I handed off a Python package; they wired it in.
+## 1. 무엇을 푸는 문제인가
 
-## Why this exists
+드론이 지도 위에서 표적을 마주쳤을 때 다음 한 수를 정해야 합니다.
+붙을지, 선회할지, 물러설지, 요격 각을 잡을지.
 
-I first tried using a single Gemma 12B for everything — situational awareness
-and immediate action selection. Inference was too slow for a real-time loop,
-so I split the model in two:
+여기서 출력은 문장이 아니라 비행 스택이 바로 먹을 수 있는 명령이어야 합니다.
 
-- A small SFT model (Gemma 4B) emits actions as JSON
-- A larger model (Gemma 12B via Ollama) handles natural-language situational
-  briefings in the background
+```json
+{"drone_1": {"action": "CHASE",
+             "params": {"desired_distance_m": 800,
+                        "desired_speed_mps": 18,
+                        "turn_rate_limit_dps": 45}}}
+```
 
-It's not as fancy as "Dual-Brain Architecture" makes it sound, but it works.
+그래서 문제는 두 겹입니다.
+하나는 상황에 맞는 행동을 고르는 것, 다른 하나는 그 행동을 **스키마를 어기지 않고** 뱉는 것입니다.
+후자를 못 하면 앞의 판단이 아무리 좋아도 기체는 아무것도 받지 못합니다.
 
-## DPO data collection
+## 2. 기존 방식으로 왜 안 됐는가
 
-In auto mode, every decision logs the candidate actions (Orbit, Chase, Retreat,
-etc.), the chosen one, and the rejected ones into
-`dpo_preference_data_v2.jsonl`. How chosen/rejected gets decided is hardcoded
-as heuristics in `dpo_core.py` — e.g. "distance > 2km → prefer Chase". This
-part is still rule-based and has obvious limits.
+**규칙 기반만으로는 부족했습니다.** 거리 임계값으로 행동을 가르면 지형, 표적 방위, 배터리가 얽힌 상황에서 금방 예외가 쌓입니다.
 
-Manual overrides should give cleaner ground truth, so when a human takes
-control, automatic DPO generation pauses. The pipeline that turns those
-override logs into training data isn't wired up yet though.
+**단일 LLM 한 대로도 안 됐습니다.** 처음에는 Gemma 12B 하나에 상황 인식과 행동 결정을 모두 시켰습니다.
+브리핑 품질은 괜찮았지만 추론이 실시간 루프에 들어갈 만큼 빠르지 않았습니다.
+결정 주기가 늘어지면 시뮬레이터에서는 답답한 정도지만 실제 기체에서는 판단이 이미 지나간 상황을 가리킵니다.
 
-## Manual control (for RLHF)
+**프롬프트만 다듬는 것도 한계가 있었습니다.** 스키마를 아무리 자세히 적어도 4B 모델은 코드펜스를 붙이거나 필수 파라미터를 빠뜨립니다.
+파싱 실패는 곧 명령 누락이라, 여기를 프롬프트가 아니라 학습으로 눌러야 했습니다.
 
-The web UI has `CHASE`, `RETREAT`, `INTERCEPT`, `PATROL` buttons that override
-the AI's decision. This becomes implicit feedback for the model.
+그래서 두 가지를 나눠 잡았습니다. 루프는 작은 모델로 빠르게 돌리고, 형식 준수는 선호 학습으로 개선합니다.
 
-## Terrain data (DSK_2026)
+## 3. 데이터와 의사결정 구조
 
-`geo_db.py` reads raster files covering the DSK 2026 venue near Anyang /
-Indeokwon. Four layers: DEM, slope, aspect, and LULC (Ministry of Environment
-land classification). Files aren't in the repo. Point to yours:
+### 결정 루프
 
-    DEM_PATH=/path/to/base_dem_3857.tif
-    SLOPE_PATH=/path/to/base_slope_3857.tif
-    ASPECT_PATH=/path/to/base_aspect_3857.tif
-    LULC_PATH=/path/to/base_l3_code_3857.tif
+`sima_app.py`의 `spinal_logic_loop`가 주기적으로 돕니다.
 
-If they're missing, the terrain module skips gracefully and the rest still runs.
+1. 텔레메트리에서 위치, 표적 거리, 방위를 받아 상태를 만듭니다 — `build_dpo_state`
+2. SFT 모델로 후보 행동 3개를 샘플링합니다 — `generate_candidates`, temperature 0.85
+3. 후보를 채점해 최선과 최악을 고릅니다 — `judge_candidates`
+4. 최선을 명령으로 내보내고, 최선과 최악의 쌍을 선호 데이터로 적립합니다
 
-## File layout
+무거운 12B 모델은 이 루프 밖에서 한국어 상황 브리핑만 담당합니다. 판단이 느려질 이유가 없어집니다.
 
-- `sima_app.py` — Flask server, simulation loop, map UI
-- `dpo_core.py` — state builder, candidate generation, scoring
-- `sima_sft.py` — loads the SFT adapter and runs action inference
-- `sima_model.py` — calls the 12B model via Ollama
-- `train_dpo.py` — uses `trl` to train a DPO adapter from the collected jsonl
-- `geo_db.py` — terrain / geospatial utilities
+### 채점 기준
 
-## Running it
+지금은 두 축입니다. `dpo_core.py`에 그대로 드러나 있습니다.
 
-Requirements:
+| 항목 | 가점 | 감점 |
+|---|---|---|
+| JSON 파싱과 필수 파라미터 검증 | +2.0 | −5.0 |
+| 거리 300m 미만에서 RETREAT | +3.0 | −2.0 |
+| 거리 2000m 초과에서 CHASE / PATROL | +2.0 | −1.0 |
+| 중거리에서 ORBIT / CHASE / PATROL | +1.0 | 0.0 |
 
-- Python 3.10+
-- PyTorch (CUDA recommended; SFT inference on CPU is painful)
-- Ollama (to host the 12B model)
-- A Hugging Face token (for Gemma access)
+형식 위반의 감점을 가장 크게 잡았습니다. 전술적으로 그럴듯해도 파싱이 안 되면 쓸 수 없는 명령이기 때문입니다.
 
-Setup:git clone https://github.com/charing999/sim2sima.git
+### 쌓지 않는 데이터
+
+로그를 무조건 쌓으면 모델이 이상한 것을 배웁니다. 두 경우는 버립니다.
+
+- 최선과 최악의 점수가 같은 경우 — 선호의 방향이 없습니다
+- 1등마저 파싱에 실패한 경우 — 이 쌍을 남기면 *덜 나쁜 쓰레기*를 선호하도록 학습합니다
+
+살아남은 쌍만 `dpo_preference_data_v2.jsonl`에 `prompt` / `chosen` / `rejected` 형태로 들어갑니다.
+점수와 판정 근거는 `meta`에 함께 적어서, 나중에 왜 이 쌍이 만들어졌는지 되짚을 수 있게 했습니다.
+
+### 사람의 개입
+
+웹 UI에 `CHASE`, `RETREAT`, `INTERCEPT`, `PATROL` 버튼이 있습니다. 사람이 개입하면 규칙 기반 자동 적립은 멈춥니다.
+사람의 판단이 더 깨끗한 정답이므로, 규칙이 만든 라벨과 섞이면 안 된다고 봤습니다.
+다만 개입 로그를 학습 쌍으로 바꾸는 부분은 아직 붙이지 못했습니다.
+
+### 지형
+
+`geo_db.py`가 DEM, 경사, 향, 토지피복 네 개 래스터를 읽어 반경 안의 지형을 요약합니다.
+DSK 2026 행사장인 안양 인덕원 일대를 덮습니다. 파일은 저장소에 없고 환경 변수로 경로를 지정합니다.
+
+```
+DEM_PATH=/path/to/base_dem_3857.tif
+SLOPE_PATH=/path/to/base_slope_3857.tif
+ASPECT_PATH=/path/to/base_aspect_3857.tif
+LULC_PATH=/path/to/base_l3_code_3857.tif
+```
+
+없으면 지형 모듈만 건너뛰고 나머지는 그대로 돕니다.
+
+## 4. 모델을 왜 이렇게 골랐는가
+
+| 역할 | 모델 | 이유 |
+|---|---|---|
+| 행동 결정 | Gemma 3 4B + LoRA | 루프 주기 안에 들어오는 유일한 크기였습니다. 출력이 고정 스키마라 큰 모델의 언어 능력이 덜 필요합니다 |
+| 상황 브리핑 | Gemma 3 12B, Ollama | 사람이 읽는 문장이라 품질이 중요하고, 루프 밖이라 지연에 여유가 있습니다 |
+
+4B 쪽은 로딩에서 한참 헤맸습니다. 결론만 적으면 bf16 + eager attention으로 두고 어댑터를 `merge_and_unload`로 병합해야 추론 중 NaN이 나오지 않았습니다.
+
+학습 방식은 SFT 위에 DPO를 얹는 2단계입니다.
+행동을 고르는 능력은 보상 설계보다 선호 쌍으로 잡는 편이 데이터 수집 비용이 훨씬 쌌습니다.
+루프가 어차피 후보 여러 개를 뽑고 있으니, 그 안에서 쌍이 공짜로 나옵니다.
+DPO는 SFT 가중치를 병합해 고정한 뒤 그 위에 새 LoRA를 학습합니다. `r=16`, 학습률 `5e-6`, 3 에폭.
+
+## 5. 어떻게 평가하는가
+
+이 시스템의 성패는 "행동이 멋있는가"가 아니라 **기체가 받을 수 있는 명령이 나왔는가**입니다. 그래서 지표도 거기에 맞췄습니다.
+
+- **파싱 성공률** — 후보마다 `parse_ok`가 붙습니다. 행동 이름이 스키마에 있는지, 필수 파라미터가 다 있는지, PATROL이 요격 의도일 때 `target_lead_time_s`가 따라왔는지까지 봅니다
+- **경고 유형별 빈도** — `missing:desired_speed_mps`처럼 무엇이 빠졌는지 로그에 남습니다. 어떤 파라미터를 자주 흘리는지 보면 다음에 무엇을 고칠지 나옵니다
+- **행동 분포** — 한 행동으로 쏠리면 후보 다양성이 죽은 것이고, DPO 쌍도 의미가 없어집니다
+- **채택 가능 쌍의 비율** — 위의 폐기 규칙을 통과해 실제로 적립된 쌍의 비율입니다. 낮으면 데이터를 모으는 시늉만 하고 있다는 뜻입니다
+- **사람의 개입 빈도** — 사람이 자주 덮어쓰는 상황이 곧 모델이 못 푸는 상황입니다
+
+UI에서는 후보마다 점수와 한국어 판정 근거를 그대로 보여줍니다. 왜 이 명령이 나갔는지 실행 중에 바로 확인할 수 있습니다.
+
+아직 없는 것도 분명히 적어둡니다. 고정된 시나리오 세트로 SFT와 DPO 어댑터를 나란히 돌려 비교하는 회귀 평가는 붙이지 못했습니다.
+지금은 실행 로그를 사후에 들여다보는 수준입니다.
+
+## 6. 실제 시스템에 어떻게 들어갔는가
+
+Drone Show Korea 2026 출품 기체에 들어갔습니다. 경계는 이렇게 잡았습니다.
+
+- 저는 Python 패키지를 넘겼습니다. 입력은 텔레메트리, 출력은 행동과 파라미터를 담은 JSON입니다
+- ROS 노드 연결과 비행 제어는 다른 엔지니어가 맡았습니다
+- 시뮬레이터의 `/get_drone_command`와 `/telemetry`가 그 인터페이스를 그대로 흉내 냅니다. 붙이는 쪽이 기체 없이도 테스트할 수 있게 하려고 했습니다
+
+넘길 때 신경 쓴 부분은 실패 처리입니다.
+모델 출력을 이해하지 못하면 `HOLD`로 떨어집니다. `ORBIT`은 선회, 즉 능동 기동이라 "무슨 말인지 모르겠는 상태"의 기본값으로 두면 안 된다고 봤습니다.
+지형 파일이 없거나 Ollama가 죽어 있어도 결정 루프는 계속 돕니다.
+
+## 7. 한계와 다음
+
+**채점이 규칙 기반입니다.** 거리 임계값 몇 개가 선호 라벨을 만듭니다. 규칙의 편향이 그대로 DPO 모델로 복사됩니다.
+사람의 개입 로그를 라벨로 쓰려던 이유가 이것이고, 아직 못 붙였습니다.
+
+**개입 로그가 학습으로 이어지지 않습니다.** 버튼은 동작하고 기록도 남지만, 이것을 선호 쌍으로 바꾸는 변환기가 없습니다. 우선순위가 제일 높습니다.
+
+**평가가 사후 관찰에 머뭅니다.** 고정 시나리오 세트와 어댑터 간 비교 스크립트가 필요합니다.
+
+**시뮬레이터가 단순합니다.** 표적은 정해진 궤적으로 움직이고 바람, 통신 지연, 센서 잡음이 없습니다. 실제 비행 스택까지의 거리는 여전히 큽니다.
+
+**지형이 판단에 덜 쓰입니다.** 브리핑에는 들어가지만 행동 채점에는 거리만 씁니다. 경사와 토지피복을 점수에 넣는 것이 자연스러운 다음 단계입니다.
+
+---
+
+## 파일 구성
+
+| 파일 | 역할 |
+|---|---|
+| `sima_app.py` | Flask 서버, 결정 루프, 지도 UI |
+| `dpo_core.py` | 상태 생성, 후보 생성, 파싱, 채점, 로깅 |
+| `sima_sft.py` | 4B SFT 어댑터 로딩과 프롬프트 구성 |
+| `sima_model.py` | Ollama를 통한 12B 브리핑 호출 |
+| `train_dpo.py` | 수집된 jsonl로 DPO 어댑터 학습 |
+| `geo_db.py` | DEM, 경사, 향, 토지피복 분석 |
+
+## 실행
+
+필요한 것은 Python 3.10 이상, PyTorch, Ollama, Gemma 접근용 Hugging Face 토큰입니다.
+SFT 추론을 CPU로 돌리면 많이 느리니 CUDA를 권합니다.
+
+```bash
+git clone https://github.com/charing999/sim2sima.git
 cd sim2sima
-pip install torch transformers peft trl flask folium requests
+pip install -r requirements.txt
+ollama pull gemma3:12b
+```
 
-The SFT adapter should be at `DPO_drone/gemma3-drone-web-sft`. Pull the
-reasoning model with `ollama pull gemma3:12b`.
+SFT 어댑터는 `DPO_drone/gemma3-drone-web-sft`에 둡니다.
 
-Run the server:python sima_app.py
+```bash
+python sima_app.py
+```
 
-Open `http://localhost:5000`. Leave it in AUTO mode to let the AI drive and
-collect data, or use the manual buttons to intervene.
+`http://localhost:5000`으로 접속합니다. AUTO로 두면 AI가 몰면서 데이터를 모으고, 수동 버튼으로 개입할 수 있습니다.
+쌍이 충분히 모이면 학습합니다.
 
-Once you've collected enough samples, train a new adapter:python train_dpo.py
+```bash
+python train_dpo.py
+```
 
-The DPO-tuned adapter gets saved to `gemma3-drone-dpo`.
+결과 어댑터는 `gemma3-drone-dpo`에 저장됩니다.
 
-## Known limitations
+## 라이선스
 
-- The chosen/rejected judgment is rule-based, so any bias in the rules
-  propagates into the DPO model.
-- Manual-override logs aren't yet converted into DPO training samples
-  automatically.
-- The simulation environment is simple. The gap to a real drone control
-  stack is large.
-
-## License
-
-Research / personal use only. Contact me for commercial use.
+연구 및 개인 용도로만 사용해 주세요. 상업적 사용은 문의 바랍니다.
